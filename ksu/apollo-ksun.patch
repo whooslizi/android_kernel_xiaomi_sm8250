@@ -1,0 +1,344 @@
+diff --git a/arch/arm64/configs/vendor/xiaomi/ksu.config b/arch/arm64/configs/vendor/xiaomi/ksu.config
+new file mode 100644
+index 000000000000..249d44c3bd63
+--- /dev/null
++++ b/arch/arm64/configs/vendor/xiaomi/ksu.config
+@@ -0,0 +1,4 @@
++# KernelSU-Next (legacy driver, manual hooks)
++CONFIG_KSU=y
++CONFIG_KSU_MANUAL_HOOK=y
++# CONFIG_KSU_DEBUG is not set
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index 5730f817f827..0c0fff69577a 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -234,4 +234,5 @@ source "drivers/sensors/Kconfig"
+ source "drivers/gpu/msm/Kconfig"
+ 
+ source "drivers/energy_model/Kconfig"
++source "drivers/kernelsu/Kconfig"
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 832134439d8c..522546de1415 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -193,3 +193,5 @@ obj-$(CONFIG_UNISYS_VISORBUS)	+= visorbus/
+ obj-$(CONFIG_SIOX)		+= siox/
+ obj-$(CONFIG_GNSS)		+= gnss/
+ obj-$(CONFIG_SENSORS_SSC)	+= sensors/
++
++obj-$(CONFIG_KSU) += kernelsu/
+diff --git a/drivers/input/input.c b/drivers/input/input.c
+index 70ffffea3e58..e7f539f2ce16 100644
+--- a/drivers/input/input.c
++++ b/drivers/input/input.c
+@@ -378,10 +378,23 @@ static int input_get_disposition(struct input_dev *dev,
+ 	return disposition;
+ }
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++extern bool ksu_input_hook __read_mostly;
++extern int ksu_handle_input_handle_event(unsigned int *type,
++					 unsigned int *code, int *value);
++#endif
++
+ static void input_handle_event(struct input_dev *dev,
+ 			       unsigned int type, unsigned int code, int value)
+ {
+-	int disposition = input_get_disposition(dev, type, code, &value);
++	int disposition;
++
++#ifdef CONFIG_KSU_MANUAL_HOOK
++	if (unlikely(ksu_input_hook))
++		ksu_handle_input_handle_event(&type, &code, &value);
++#endif
++
++	disposition = input_get_disposition(dev, type, code, &value);
+ 
+ 	if (disposition != INPUT_IGNORE_EVENT && type != EV_SYN)
+ 		add_input_randomness(type, code, value);
+diff --git a/fs/exec.c b/fs/exec.c
+index f0def1bcbdec..ec023d711cbf 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1725,6 +1725,11 @@ static int exec_binprm(struct linux_binprm *bprm)
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
++			       void *argv, void *envp, int *flags);
++#endif
++
+ /*
+  * sys_execve() executes a new program.
+  */
+@@ -1741,6 +1746,12 @@ static int __do_execve_file(int fd, struct filename *filename,
+ 	if (IS_ERR(filename))
+ 		return PTR_ERR(filename);
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++	/* do_execve_file() passes a NULL filename; nothing to hook there */
++	if (filename)
++		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
++#endif
++
+ 	/*
+ 	 * We move the actual failure in case of RLIMIT_NPROC excess from
+ 	 * set*uid() to execve() because too many poorly written programs
+diff --git a/fs/internal.h b/fs/internal.h
+index c02439a5d2d1..86ccac4a6ac4 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -86,6 +86,7 @@ extern int finish_automount(struct vfsmount *, struct path *);
+ extern int sb_prepare_remount_readonly(struct super_block *);
+ 
+ extern void __init mnt_init(void);
++int path_umount(struct path *path, int flags);
+ 
+ extern int __mnt_want_write_file(struct file *);
+ extern void __mnt_drop_write_file(struct file *);
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 4a69b910710f..5a0bbf438884 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1762,6 +1762,36 @@ SYSCALL_DEFINE1(oldumount, char __user *, name)
+ 
+ #endif
+ 
++static int can_umount(const struct path *path, int flags)
++ {
++	 struct mount *mnt = real_mount(path->mnt);
++	 if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
++		 return -EINVAL;
++	 if (!may_mount())
++		 return -EPERM;
++	 if (path->dentry != path->mnt->mnt_root)
++		 return -EINVAL;
++	 if (!check_mnt(mnt))
++		 return -EINVAL;
++	 if (mnt->mnt.mnt_flags & MNT_LOCKED)
++		 return -EINVAL;
++	 if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
++		 return -EPERM;
++	 return 0;
++ }
++
++int path_umount(struct path *path, int flags)
++ {
++	 struct mount *mnt = real_mount(path->mnt);
++	 int ret;
++	 ret = can_umount(path, flags);
++	 if (!ret)
++		 ret = do_umount(mnt, flags);
++	 dput(path->dentry);
++	 mntput_no_expire(mnt);
++	 return ret;
++ }
++
+ static bool is_mnt_ns_file(struct dentry *dentry)
+ {
+ 	/* Is this a proxy for a mount namespace? */
+diff --git a/fs/open.c b/fs/open.c
+index 13d70db567e0..e1920f8181f2 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -354,6 +354,11 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
+  * We do this by temporarily clearing all FS-related capabilities and
+  * switching the fsuid/fsgid around to the real ones.
+  */
++#ifdef CONFIG_KSU_MANUAL_HOOK
++extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
++				int *mode, int *flags);
++#endif
++
+ long do_faccessat(int dfd, const char __user *filename, int mode)
+ {
+ 	const struct cred *old_cred;
+@@ -364,6 +369,10 @@ long do_faccessat(int dfd, const char __user *filename, int mode)
+ 	int res;
+ 	unsigned int lookup_flags = LOOKUP_FOLLOW;
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
++#endif
++
+ 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
+ 		return -EINVAL;
+ 
+diff --git a/fs/read_write.c b/fs/read_write.c
+index ec2d20ddd766..89d2740981d8 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -571,11 +571,23 @@ static inline void file_pos_write(struct file *file, loff_t pos)
+ 		file->f_pos = pos;
+ }
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++extern bool ksu_init_rc_hook __read_mostly;
++extern void ksu_handle_sys_read(unsigned int fd);
++#endif
++
+ ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
+ {
+-	struct fd f = fdget_pos(fd);
++	struct fd f;
+ 	ssize_t ret = -EBADF;
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++	if (unlikely(ksu_init_rc_hook))
++		ksu_handle_sys_read(fd);
++#endif
++
++	f = fdget_pos(fd);
++
+ 	if (f.file) {
+ 		loff_t pos = file_pos_read(f.file);
+ 		ret = vfs_read(f.file, buf, count, &pos);
+diff --git a/fs/stat.c b/fs/stat.c
+index 376543199b5a..738afd14f1f6 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -163,6 +163,17 @@ EXPORT_SYMBOL(vfs_statx_fd);
+  *
+  * 0 will be returned on success, and a -ve error code if unsuccessful.
+  */
++#ifdef CONFIG_KSU_MANUAL_HOOK
++extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
++			   int *flags);
++extern void ksu_handle_newfstat_ret(unsigned int *fd,
++				    struct stat __user **statbuf_ptr);
++#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
++extern void ksu_handle_fstat64_ret(unsigned long *fd,
++				   struct stat64 __user **statbuf_ptr);
++#endif
++#endif
++
+ int vfs_statx(int dfd, const char __user *filename, int flags,
+ 	      struct kstat *stat, u32 request_mask)
+ {
+@@ -170,6 +181,10 @@ int vfs_statx(int dfd, const char __user *filename, int flags,
+ 	int error = -EINVAL;
+ 	unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++	ksu_handle_stat(&dfd, &filename, &flags);
++#endif
++
+ 	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
+ 		       AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
+ 		return -EINVAL;
+@@ -375,6 +390,11 @@ SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+ 	if (!error)
+ 		error = cp_new_stat(&stat, statbuf);
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++	if (!error)
++		ksu_handle_newfstat_ret(&fd, &statbuf);
++#endif
++
+ 	return error;
+ }
+ 
+@@ -501,6 +521,11 @@ SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
+ 	if (!error)
+ 		error = cp_new_stat64(&stat, statbuf);
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++	if (!error)
++		ksu_handle_fstat64_ret(&fd, &statbuf);
++#endif
++
+ 	return error;
+ }
+ 
+diff --git a/include/linux/seccomp.h b/include/linux/seccomp.h
+index e5320f6c8654..e77f7b4f39ca 100644
+--- a/include/linux/seccomp.h
++++ b/include/linux/seccomp.h
+@@ -11,6 +11,7 @@
+ #ifdef CONFIG_SECCOMP
+ 
+ #include <linux/thread_info.h>
++#include <linux/atomic.h>
+ #include <asm/seccomp.h>
+ 
+ struct seccomp_filter;
+@@ -27,6 +28,7 @@ struct seccomp_filter;
+  */
+ struct seccomp {
+ 	int mode;
++	atomic_t filter_count;
+ 	struct seccomp_filter *filter;
+ };
+ 
+diff --git a/kernel/reboot.c b/kernel/reboot.c
+index 19f89c07460a..41fe544c0cf3 100644
+--- a/kernel/reboot.c
++++ b/kernel/reboot.c
+@@ -305,6 +305,11 @@ DEFINE_MUTEX(system_transition_mutex);
+  *
+  * reboot doesn't sync: do that yourself before calling this.
+  */
++#ifdef CONFIG_KSU_MANUAL_HOOK
++extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
++				 void __user **arg);
++#endif
++
+ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+ 		void __user *, arg)
+ {
+@@ -312,6 +317,10 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+ 	char buffer[256];
+ 	int ret = 0;
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
++#endif
++
+ 	/* We only trust the superuser with rebooting the system. */
+ 	if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))
+ 		return -EPERM;
+diff --git a/tools/ksu/anykernel.sh b/tools/ksu/anykernel.sh
+new file mode 100644
+index 000000000000..4f434e5c1266
+--- /dev/null
++++ b/tools/ksu/anykernel.sh
+@@ -0,0 +1,37 @@
++### AnyKernel3 Ramdisk Mod Script
++## Redmi K30S Ultra / Mi 10T / Mi 10T Pro (apollo) + KernelSU-Next
++
++### AnyKernel setup
++# global properties
++properties() { '
++kernel.string=apollo 4.19 + KernelSU-Next (manual hooks) by whooslizi
++do.devicecheck=1
++do.modules=0
++do.systemless=0
++do.cleanup=1
++do.cleanuponabort=0
++device.name1=apollo
++device.name2=apollon
++device.name3=apollopro
++device.name4=
++device.name5=
++supported.versions=
++supported.patchlevels=
++supported.vendorpatchlevels=
++'; } # end properties
++
++
++### AnyKernel install
++# boot shell variables
++BLOCK=boot;
++IS_SLOT_DEVICE=auto;
++RAMDISK_COMPRESSION=auto;
++PATCH_VBMETA_FLAG=auto;
++
++# import functions/variables and setup patching - see for reference (DO NOT REMOVE)
++. tools/ak3-core.sh;
++
++# kernel-only swap: keep the ROM's ramdisk, dtb and dtbo untouched
++split_boot;
++flash_boot;
++## end boot install
