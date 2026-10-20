@@ -1,0 +1,72 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: "KernelSU-Next ref (branch/tag/commit)"
+        required: false
+        default: "0b17f24246db5c80c056b92c15bcad2b77f1276e"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      KSU_REF: ${{ inputs.ksu_ref || '0b17f24246db5c80c056b92c15bcad2b77f1276e' }}
+      DEFCONFIGS: >-
+        vendor/kona-perf_defconfig
+        vendor/xiaomi/sm8250-common.config
+        vendor/xiaomi/apollo.config
+        vendor/xiaomi/ksu.config
+      MAKE_ARGS: >-
+        O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang
+        CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm bc bison flex cpio libssl-dev libelf-dev \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi zip
+
+      - name: Apply hooks patch
+        run: git apply --verbose ksu/apollo-ksun.patch
+
+      - name: Add KernelSU-Next (legacy)
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s "$KSU_REF"
+          git -C KernelSU-Next fetch --tags origin || true
+          git -C KernelSU-Next log -1 --oneline
+
+      - name: Configure
+        run: |
+          make $MAKE_ARGS $DEFCONFIGS
+          grep -E '^CONFIG_KSU(_MANUAL_HOOK)?=y' out/.config
+
+      - name: Build
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" $MAKE_ARGS 2>&1 | tee build.log
+          grep -q "KernelSU-Next: Hook mode: Manual" build.log
+          test -f out/arch/arm64/boot/Image
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/modules ak3/patch ak3/ramdisk
+          cp tools/ksu/anykernel.sh ak3/anykernel.sh
+          cp out/arch/arm64/boot/Image ak3/Image
+          ZIP="apollo-ksun-$(git -C KernelSU-Next rev-parse --short HEAD)-$(date +%Y%m%d).zip"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          (cd ak3 && zip -r9 "../$ZIP" .)
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP }}
+          path: ${{ env.ZIP }}
