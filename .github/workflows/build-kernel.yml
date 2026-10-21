@@ -4,15 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       ksu_ref:
-        description: "KernelSU-Next ref (branch/tag/commit)"
+        description: "KernelSU-Next ref (465490a2 = UAPI v5, matches manager v3.4.2)"
         required: false
-        default: "0b17f24246db5c80c056b92c15bcad2b77f1276e"
+        default: "465490a2"
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     env:
-      KSU_REF: ${{ inputs.ksu_ref || '0b17f24246db5c80c056b92c15bcad2b77f1276e' }}
+      KSU_REF: ${{ inputs.ksu_ref || '465490a2' }}
       DEFCONFIGS: >-
         vendor/kona-perf_defconfig
         vendor/xiaomi/sm8250-common.config
@@ -27,21 +30,48 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Locate inputs
+        run: |
+          find_one() { find . -path ./out -prune -o -path ./.git -prune -o -type f -name "$1" -print | head -1; }
+          PATCH=$(find_one 'apollo-ksun.patch')
+          SWAP=$(find_one 'swapkernel.py')
+          STOCK=$(find_one 'boot-stock.img.gz')
+          [ -z "$STOCK" ] && STOCK=$(find_one 'boot-stock.img')
+          echo "patch: ${PATCH:-MISSING}"; echo "swap:  ${SWAP:-MISSING}"; echo "stock: ${STOCK:-MISSING}"
+          [ -n "$PATCH" ] && [ -n "$SWAP" ] && [ -n "$STOCK" ] || { echo "::error::missing input file(s), see above"; exit 1; }
+          echo "PATCH=$PATCH" >> "$GITHUB_ENV"
+          echo "SWAP=$SWAP" >> "$GITHUB_ENV"
+          echo "STOCK=$STOCK" >> "$GITHUB_ENV"
+
       - name: Install deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang lld llvm bc bison flex cpio libssl-dev libelf-dev \
-            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi zip
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+
+      - name: Prepare stock boot.img
+        run: |
+          mkdir -p stock
+          case "$STOCK" in
+            *.gz) gunzip -c "$STOCK" > stock/boot-stock.img ;;
+            *)    cp "$STOCK" stock/boot-stock.img ;;
+          esac
+          head -c 8 stock/boot-stock.img | grep -q 'ANDROID!' || { echo "::error::not a boot image"; exit 1; }
+          ls -lh stock/boot-stock.img
 
       - name: Apply hooks patch
-        run: git apply --verbose ksu/apollo-ksun.patch
+        run: git apply --verbose "$PATCH"
 
       - name: Add KernelSU-Next (legacy)
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             | bash -s "$KSU_REF"
           git -C KernelSU-Next fetch --tags origin || true
-          git -C KernelSU-Next log -1 --oneline
+          git -C KernelSU-Next checkout -q "$KSU_REF"
+          UAPI=$(grep -oP 'define KERNEL_SU_UAPI_VERSION \K[0-9]+' KernelSU-Next/uapi/supercall.h || echo "?")
+          echo "KSU-Next $(git -C KernelSU-Next rev-parse --short HEAD), UAPI v$UAPI"
+          echo "KSU_SHORT=$(git -C KernelSU-Next rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "KSU_UAPI=$UAPI" >> "$GITHUB_ENV"
 
       - name: Configure
         run: |
@@ -55,18 +85,25 @@ jobs:
           grep -q "KernelSU-Next: Hook mode: Manual" build.log
           test -f out/arch/arm64/boot/Image
 
-      - name: Package AnyKernel3
+      - name: Make boot.img
         run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
-          rm -rf ak3/.git ak3/.github ak3/README.md ak3/modules ak3/patch ak3/ramdisk
-          cp tools/ksu/anykernel.sh ak3/anykernel.sh
-          cp out/arch/arm64/boot/Image ak3/Image
-          ZIP="apollo-ksun-$(git -C KernelSU-Next rev-parse --short HEAD)-$(date +%Y%m%d).zip"
-          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
-          (cd ak3 && zip -r9 "../$ZIP" .)
+          python3 "$SWAP" stock/boot-stock.img out/arch/arm64/boot/Image boot-ksun.img
+          TAG="apollo-ksun-${KSU_SHORT}-$(date +%Y%m%d-%H%M)"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          sha256sum boot-ksun.img | tee boot-ksun.img.sha256
 
-      - name: Upload
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ZIP }}
-          path: ${{ env.ZIP }}
+          name: ${{ env.TAG }}
+          path: |
+            boot-ksun.img
+            boot-ksun.img.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          body: |
+            KernelSU-Next `${{ env.KSU_SHORT }}` (UAPI v${{ env.KSU_UAPI }}), manual hooks.
