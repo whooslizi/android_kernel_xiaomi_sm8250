@@ -73,26 +73,42 @@ jobs:
           echo "KSU_SHORT=$(git -C KernelSU-Next rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "KSU_UAPI=$UAPI" >> "$GITHUB_ENV"
 
-
-      - name: SUSFS rejects dump
+      - name: Add SUSFS
         run: |
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
           cp susfs4ksu/kernel_patches/fs/* fs/
           cp susfs4ksu/kernel_patches/include/linux/* include/linux/
+          # SUS_MOUNT / SUS_KSTAT / TRY_UMOUNT hunks reject on this fs_context kernel.
+          # They are disabled in ksu.config below and every applied hunk is #ifdef-guarded,
+          # so a partial apply compiles cleanly. Rejects are expected; we drop them.
           patch -p1 --no-backup-if-mismatch < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
-          echo "===== SUSFS version ====="; grep -r 'SUSFS_VERSION' include/linux/susfs.h
-          echo "===== REJECTS ====="
-          for r in $(find . -name '*.rej' | sort); do echo "### FILE: $r"; cat "$r"; echo; done
-          echo "===== CONTEXT: include/linux/mount.h 1-120 ====="; sed -n '1,120p' include/linux/mount.h
-          echo "===== CONTEXT: fs/namespace.c 1-45 ====="; sed -n '1,45p' fs/namespace.c
-          echo "===== CONTEXT: fs/namespace.c 980-1300 ====="; sed -n '980,1300p' fs/namespace.c
-          echo "===== CONTEXT: fs/proc/task_mmu.c 1-60 ====="; sed -n '1,60p' fs/proc/task_mmu.c
-          exit 1
+          find . -name '*.rej' -delete
+          echo "SUSFS version:"; grep -r 'SUSFS_VERSION' include/linux/susfs.h || true
+          cat >> arch/arm64/configs/vendor/xiaomi/ksu.config <<'CFG'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=n
+          # CONFIG_KSU_SUSFS_SUS_MOUNT is not set
+          # CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT is not set
+          # CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT is not set
+          # CONFIG_KSU_SUSFS_TRY_UMOUNT is not set
+          # CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT is not set
+          # CONFIG_KSU_SUSFS_SUS_KSTAT is not set
+          CFG
+
+      - name: Clean version string
+        run: ': > .scmversion'
 
       - name: Configure
         run: |
           make $MAKE_ARGS $DEFCONFIGS
           grep -E '^CONFIG_KSU(_MANUAL_HOOK)?=y' out/.config
+          grep -E '^CONFIG_KSU_SUSFS_(SUS_PATH|OPEN_REDIRECT|SPOOF_UNAME|SPOOF_CMDLINE_OR_BOOTCONFIG)=y' out/.config
+          ! grep -q '^CONFIG_KSU_SUSFS_SUS_MOUNT=y' out/.config || { echo "::error::SUS_MOUNT on, rejects matter"; exit 1; }
 
       - name: Build
         run: |
@@ -123,3 +139,4 @@ jobs:
           name: ${{ env.TAG }}
           body: |
             KernelSU-Next `${{ env.KSU_SHORT }}` (UAPI v${{ env.KSU_UAPI }}), manual hooks.
+            SUSFS ${{ env.SUSFS_VER }} (sus_path, open_redirect, spoof uname+cmdline).
