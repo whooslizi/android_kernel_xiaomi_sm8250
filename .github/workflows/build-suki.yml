@@ -1,0 +1,136 @@
+name: Build SukiSu-Ultra
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: "SukiSU-Ultra ref (builtin = manual hooks + SUSFS)"
+        required: false
+        default: "builtin"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      KSU_REF: ${{ inputs.ksu_ref || 'builtin' }}
+      DEFCONFIGS: >-
+        vendor/kona-perf_defconfig
+        vendor/xiaomi/sm8250-common.config
+        vendor/xiaomi/apollo.config
+        vendor/xiaomi/ksu.config
+      MAKE_ARGS: >-
+        O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang
+        CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Locate inputs
+        run: |
+          find_one() { find . -path ./out -prune -o -path ./.git -prune -o -type f -name "$1" -print | head -1; }
+          PATCH=$(find_one 'apollo-ksun.patch')
+          SWAP=$(find_one 'swapkernel.py')
+          STOCK=$(find_one 'boot-stock.img.gz')
+          [ -z "$STOCK" ] && STOCK=$(find_one 'boot-stock.img')
+          echo "patch: ${PATCH:-MISSING}"; echo "swap:  ${SWAP:-MISSING}"; echo "stock: ${STOCK:-MISSING}"
+          [ -n "$PATCH" ] && [ -n "$SWAP" ] && [ -n "$STOCK" ] || { echo "::error::missing input file(s)"; exit 1; }
+          echo "PATCH=$PATCH" >> "$GITHUB_ENV"
+          echo "SWAP=$SWAP" >> "$GITHUB_ENV"
+          echo "STOCK=$STOCK" >> "$GITHUB_ENV"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm bc bison flex cpio libssl-dev libelf-dev \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+
+      - name: Prepare stock boot.img
+        run: |
+          mkdir -p stock
+          case "$STOCK" in
+            *.gz) gunzip -c "$STOCK" > stock/boot-stock.img ;;
+            *)    cp "$STOCK" stock/boot-stock.img ;;
+          esac
+          head -c 8 stock/boot-stock.img | grep -q 'ANDROID!' || { echo "::error::not a boot image"; exit 1; }
+          ls -lh stock/boot-stock.img
+
+      - name: Apply hooks patch
+        run: git apply --verbose "$PATCH"
+
+      - name: Add SukiSU-Ultra (builtin)
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/builtin/kernel/setup.sh" | bash -s "$KSU_REF"
+          test -d KernelSU || { echo "::error::SukiSU not set up (expected KernelSU/ dir)"; exit 1; }
+          KSU_SHORT=$(git -C KernelSU rev-parse --short HEAD)
+          echo "SukiSU-Ultra $KSU_REF @ $KSU_SHORT"
+          echo "KSU_SHORT=$KSU_SHORT" >> "$GITHUB_ENV"
+
+      - name: Add SUSFS
+        run: |
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
+          cp susfs4ksu/kernel_patches/fs/* fs/
+          cp susfs4ksu/kernel_patches/include/linux/* include/linux/
+          # SUS_MOUNT / SUS_KSTAT hunks reject on this fs_context kernel; disabled below,
+          # applied hunks are #ifdef-guarded, so the partial apply compiles.
+          patch -p1 --no-backup-if-mismatch < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
+          find . -path ./KernelSU -prune -o -name '*.rej' -print -exec rm {} \;
+          SUSFS_VER=$(grep -oP 'SUSFS_VERSION "\K[^"]+' include/linux/susfs.h || echo "?")
+          echo "SUSFS $SUSFS_VER"; echo "SUSFS_VER=$SUSFS_VER" >> "$GITHUB_ENV"
+          cat >> arch/arm64/configs/vendor/xiaomi/ksu.config <<'CFG'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=n
+          # CONFIG_KSU_SUSFS_SUS_MOUNT is not set
+          # CONFIG_KSU_SUSFS_SUS_KSTAT is not set
+          CFG
+
+      - name: Clean version string
+        run: ': > .scmversion'
+
+      - name: Configure
+        run: |
+          make $MAKE_ARGS $DEFCONFIGS
+          grep -E '^CONFIG_KSU=y' out/.config
+          grep -E '^CONFIG_KSU_SUSFS' out/.config || { echo "::error::SUSFS symbols dropped"; exit 1; }
+          ! grep -q '^CONFIG_KSU_SUSFS_SUS_MOUNT=y' out/.config || { echo "::error::SUS_MOUNT on"; exit 1; }
+
+      - name: Build
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" $MAKE_ARGS 2>&1 | tee build.log
+          test -f out/arch/arm64/boot/Image
+          strings out/arch/arm64/boot/Image | grep -m1 'Linux version'
+
+      - name: Make boot.img
+        run: |
+          python3 "$SWAP" stock/boot-stock.img out/arch/arm64/boot/Image boot-sukisu.img
+          TAG="apollo-sukisu-${KSU_SHORT}-$(date +%Y%m%d-%H%M)"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          sha256sum boot-sukisu.img | tee boot-sukisu.img.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAG }}
+          path: |
+            boot-sukisu.img
+            boot-sukisu.img.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          body: |
+            SukiSU-Ultra builtin `${{ env.KSU_SHORT }}`, manual hooks.
+            SUSFS ${{ env.SUSFS_VER }}: sus_path, open_redirect, spoof uname + cmdline.
