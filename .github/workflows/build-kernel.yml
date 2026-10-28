@@ -78,12 +78,29 @@ jobs:
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
           cp susfs4ksu/kernel_patches/fs/* fs/
           cp susfs4ksu/kernel_patches/include/linux/* include/linux/
-          # SUS_MOUNT / SUS_KSTAT / TRY_UMOUNT hunks reject on this fs_context kernel.
-          # They are disabled in ksu.config below and every applied hunk is #ifdef-guarded,
-          # so a partial apply compiles cleanly. Rejects are expected; we drop them.
+
+          # Kernel side. SUS_MOUNT / SUS_KSTAT / TRY_UMOUNT hunks reject on this
+          # fs_context kernel; those features are disabled below and every applied
+          # hunk is #ifdef-guarded, so the partial apply is safe.
           patch -p1 --no-backup-if-mismatch < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
-          find . -name '*.rej' -delete
-          echo "SUSFS version:"; grep -r 'SUSFS_VERSION' include/linux/susfs.h || true
+          find . -path ./KernelSU-Next -prune -o -name '*.rej' -print -exec rm {} \;
+
+          # KSU side: SUSFS Kconfig symbols + the ksu_susfs command glue live in KernelSU-Next.
+          if grep -q 'config KSU_SUSFS' KernelSU-Next/kernel/Kconfig; then
+            echo "KSU-Next already has SUSFS"
+          else
+            ls susfs4ksu/kernel_patches/KernelSU/
+            ( cd KernelSU-Next && patch -p1 --no-backup-if-mismatch < ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ) || true
+            echo "===== KSU-side rejects ====="
+            find KernelSU-Next -name '*.rej' -print -exec cat {} \;
+            grep -q 'config KSU_SUSFS' KernelSU-Next/kernel/Kconfig \
+              || { echo "::error::KSU-side SUSFS patch did not apply to KSU-Next $KSU_SHORT (see rejects above)"; exit 1; }
+          fi
+
+          SUSFS_VER=$(grep -oP 'SUSFS_VERSION "\K[^"]+' include/linux/susfs.h || echo "?")
+          echo "SUSFS $SUSFS_VER"
+          echo "SUSFS_VER=$SUSFS_VER" >> "$GITHUB_ENV"
+
           cat >> arch/arm64/configs/vendor/xiaomi/ksu.config <<'CFG'
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
@@ -107,7 +124,7 @@ jobs:
         run: |
           make $MAKE_ARGS $DEFCONFIGS
           grep -E '^CONFIG_KSU(_MANUAL_HOOK)?=y' out/.config
-          grep -E '^CONFIG_KSU_SUSFS_(SUS_PATH|OPEN_REDIRECT|SPOOF_UNAME|SPOOF_CMDLINE_OR_BOOTCONFIG)=y' out/.config
+          grep -E '^CONFIG_KSU_SUSFS' out/.config || { echo "::error::SUSFS symbols dropped by Kconfig"; exit 1; }
           ! grep -q '^CONFIG_KSU_SUSFS_SUS_MOUNT=y' out/.config || { echo "::error::SUS_MOUNT on, rejects matter"; exit 1; }
 
       - name: Build
@@ -120,7 +137,7 @@ jobs:
       - name: Make boot.img
         run: |
           python3 "$SWAP" stock/boot-stock.img out/arch/arm64/boot/Image boot-ksun.img
-          TAG="apollo-ksun-${KSU_SHORT}-$(date +%Y%m%d-%H%M)"
+          TAG="apollo-ksun-${KSU_SHORT}-susfs-$(date +%Y%m%d-%H%M)"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           sha256sum boot-ksun.img | tee boot-ksun.img.sha256
 
@@ -139,4 +156,4 @@ jobs:
           name: ${{ env.TAG }}
           body: |
             KernelSU-Next `${{ env.KSU_SHORT }}` (UAPI v${{ env.KSU_UAPI }}), manual hooks.
-            SUSFS ${{ env.SUSFS_VER }} (sus_path, open_redirect, spoof uname+cmdline).
+            SUSFS ${{ env.SUSFS_VER }}: sus_path, open_redirect, spoof uname + cmdline.
