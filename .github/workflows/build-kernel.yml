@@ -74,18 +74,20 @@ jobs:
           echo "KSU_UAPI=$UAPI" >> "$GITHUB_ENV"
 
 
-      - name: Add SUSFS
+      - name: SUSFS rejects dump
         run: |
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
           cp susfs4ksu/kernel_patches/fs/* fs/
           cp susfs4ksu/kernel_patches/include/linux/* include/linux/
-          patch -p1 < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch
-          # KSU-Next 465490a2 should have native susfs; only patch if symbols are missing:
-          if ! grep -rqi susfs KernelSU-Next/kernel/ 2>/dev/null; then
-            ( cd KernelSU-Next && patch -p1 < ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch )
-          fi
-          ls fs/*.rej include/linux/*.rej 2>/dev/null && { echo "::error::susfs patch rejects"; exit 1; } || true
-          echo "SUSFS kernel ver:"; grep -r 'SUSFS_VERSION' include/linux/susfs.h
+          patch -p1 --no-backup-if-mismatch < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
+          echo "===== SUSFS version ====="; grep -r 'SUSFS_VERSION' include/linux/susfs.h
+          echo "===== REJECTS ====="
+          for r in $(find . -name '*.rej' | sort); do echo "### FILE: $r"; cat "$r"; echo; done
+          echo "===== CONTEXT: include/linux/mount.h 1-120 ====="; sed -n '1,120p' include/linux/mount.h
+          echo "===== CONTEXT: fs/namespace.c 1-45 ====="; sed -n '1,45p' fs/namespace.c
+          echo "===== CONTEXT: fs/namespace.c 980-1300 ====="; sed -n '980,1300p' fs/namespace.c
+          echo "===== CONTEXT: fs/proc/task_mmu.c 1-60 ====="; sed -n '1,60p' fs/proc/task_mmu.c
+          exit 1
 
       - name: Configure
         run: |
