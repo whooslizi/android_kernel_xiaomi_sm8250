@@ -69,7 +69,10 @@ jobs:
           KSU_SHORT=$(git -C KernelSU rev-parse --short HEAD)
           echo "SukiSU-Ultra $KSU_REF @ $KSU_SHORT"
           echo "KSU_SHORT=$KSU_SHORT" >> "$GITHUB_ENV"
-
+          # 4.19 has no <linux/static_call.h> (5.10+); SukiSU includes it but never uses it. Guard by version.
+          sed -i 's|#include <linux/static_call.h>|#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n#include <linux/static_call.h>\n#endif|' KernelSU/kernel/kernel_includes.h
+          grep -n 'static_call' KernelSU/kernel/kernel_includes.h
+          
       - name: Add SUSFS
         run: |
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19
